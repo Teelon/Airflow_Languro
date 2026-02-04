@@ -58,3 +58,12 @@ astro dev stop
 ```powershell
 astro dev logs
 ```
+
+**Clear DAG run history**:
+To delete all run history for a specific DAG (useful for starting fresh):
+```powershell
+astro dev bash
+# Inside the container:
+airflow dags delete verb_audio_generation --yes
+exit
+```
