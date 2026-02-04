@@ -1,34 +1,60 @@
-# Project Overview
+# Languro Airflow Pipelines
 
-Apache Airflow is one of the most widely-used engines for orchestrating Extract, Transform, and Load (ETL) jobs, especially for transformations using [dbt](https://www.getdbt.com). dbt is a framework to create reliable transformations to produce high-quality data for businesses, usually in analytical databases like Snowflake and BigQuery.
+This project manages the data orchestration for Languro, specifically the generation of high-quality verb conjugation audio using Gemini 2.5 TTS and storage in Cloudflare R2.
 
-This project showcases using dbt and Airflow together with [Cosmos](https://github.com/astronomer/astronomer-cosmos), allowing users to deploy dbt in production with Airflow best-practices.
+## 🚀 Quick Start
 
-Astronomer is the best place to host Apache Airflow -- try it out with a free trial at [astronomer.io](https://www.astronomer.io/).
+### 1. Prerequisites
+- **Docker Desktop**: Must be running.
+- **Astro CLI**: The easiest way to run Airflow locally. [Install it here](https://www.astronomer.io/docs/astro/cli/install-cli).
 
-# Learning Paths
+### 2. Configuration
+Copy the example environment file and fill in your credentials:
+```powershell
+cp .env.example .env
+```
+Open `.env` and provide:
+- **R2 Credentials**: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ACCOUNT_ID`, and `R2_BUCKET_NAME`.
+- **Database**: `AIRFLOW_CONN_LANGURO_DB` (Postgres URL for the main Languro app).
+- **Gemini SPI**: `GEMINI_API_KEY`.
 
-To learn more about data engineering with Apache Airflow, dbt, and Cosmos, make a few changes to this project! For example, try one of the following:
+### 3. Build and Run
+Start the Airflow environment:
+```powershell
+astro dev start
+```
+This will:
+1. Build a custom Docker image with all dependencies (`google-genai`, `boto3`, etc.).
+2. Initialize a local Postgres metadata database.
+3. Start the Webserver, Scheduler, and Triggerer.
 
-1. Use Postgres, MySQL, Snowflake, or another production-ready database instead of DuckDB
-2. Change the Cosmos DbtDag to Cosmos DbtTaskGroups! For extra help, check out the [Cosmos examples of DbtTaskGroups](https://github.com/astronomer/astronomer-cosmos/blob/main/dev/dags/basic_cosmos_task_group.py)
+### 4. Access the UI
+Once the command completes, go to:
+- **URL**: [http://localhost:8080](http://localhost:8080)
+- **Login**: `admin` / `admin`
 
-# Project Contents
+---
 
-Your Astro project contains the following files and folders:
+## 🏗️ Pipelines (DAGs)
 
-- dags: This folder contains the Python files for your Airflow DAGs. This project includes one example DAG:
-  - `dbt_cosmos_dag.py`: This DAG sets up [Cosmos](https://github.com/astronomer/astronomer-cosmos), allowing files in the /dbt directory to transform into Airflow tasks and taskgroups.
-- dbt/jaffle_shop: This folder contains the dbt project [jaffle_shop](https://github.com/dbt-labs/jaffle_shop_duckdb), a fictional ecommerce store. Use this as a starting point to learn how dbt and Airflow work together!
-- Dockerfile: This file contains a versioned Astro Runtime Docker image that provides a differentiated Airflow experience. If you want to execute other commands or overrides at runtime, specify them here.
-- include: This folder contains any additional files that you want to include as part of your project. In this example, constants.py includes configuration for your Cosmos project.
-- packages.txt: Install OS-level packages needed for your project by adding them to this file. It is empty by default.
-- requirements.txt: Install Python packages needed for your project by adding them to this file. In this project, we pin the Cosmos version.
-- plugins: Add custom or community plugins for your project to this file. It is empty by default.
-- airflow_settings.yaml: Use this local-only file to specify Airflow Connections, Variables, and Pools instead of entering them in the Airflow UI as you develop DAGs in this project.
+### `verb_audio_generation`
+This is the core pipeline for Languro's content:
+1. **Fetch**: Queries the Languro database for conjugations missing audio.
+2. **Generate**: Calls Gemini 2.5 (`gemini-2.5-pro-preview-tts`) with language-specific pronunciation rules.
+3. **Format**: Generates high-efficiency `.opus` audio files.
+4. **Store**: Uploads files to R2 using the convention: `conjugation/{iso_code}/{verb}/{tense}/{pronoun}_{form}.opus`.
+5. **Update**: Writes the R2 key back to the database and marks `has_audio = true`.
 
-# Deploying to Production
+## 🛠️ Maintenance
 
-### ❗Warning❗
+**Adding new dependencies**: Add them to `requirements.txt` and run `astro dev restart`.
 
-This template used DuckDB, an in-memory database, for running dbt transformations. While this is great to learn Airflow, your data is not guaranteed to persist between executions! For production applications, use a _persistent database_ instead (consider DuckDB's hosted option MotherDuck or another database like Postgres, MySQL, or Snowflake).
+**Stop the environment**:
+```powershell
+astro dev stop
+```
+
+**View logs**:
+```powershell
+astro dev logs
+```
