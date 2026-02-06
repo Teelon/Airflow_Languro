@@ -54,7 +54,7 @@ DB_CONN_ID = "languro_db"
 # 300 requests × 30 tokens = ~9k tokens (safe margin under 25k)
 BATCH_SIZE = 300
 MAX_BATCH_TOKENS = 25000
-DAG_VERSION = "2.0.1-minimal-text-production"
+DAG_VERSION = "2.1.0-skip-on-empty"
 
 default_args = {
     "owner": "airflow",
@@ -68,7 +68,7 @@ default_args = {
     dag_id="verb_audio_generation_batch",
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
-    schedule="*/40 * * * *",
+    schedule="0 * * * *",  # Once per hour at minute 0
     catchup=False,
     max_active_runs=1,
     max_active_tasks=1,
@@ -215,6 +215,10 @@ def verb_audio_generation_batch_dag():
         client = genai.Client(api_key=GEMINI_API_KEY)
         jsonl_lines = batch_data['jsonl_lines']
         
+        if not jsonl_lines:
+            logging.info("No requests to submit. Skipping batch submission.")
+            return None
+            
         logging.info(f"Submitting batch job with {len(jsonl_lines)} requests via JSONL file")
         
         # Retry settings for 429 errors
@@ -302,6 +306,10 @@ def verb_audio_generation_batch_dag():
         Poll batch job until completion.
         Returns: batch info with job status
         """
+        if not batch_info:
+            logging.info("No batch info provided. Skipping polling.")
+            return None
+            
         if not GEMINI_API_KEY:
             raise AirflowFailException("GEMINI_API_KEY not found")
 
@@ -323,9 +331,16 @@ def verb_audio_generation_batch_dag():
                 raise
 
         # Poll for completion
-        max_wait_time = 600  # 10 minutes
-        poll_interval = 15
+        # With 300 requests, batch jobs typically complete in 7-10 minutes
+        max_wait_time = 900  # 15 minutes max
+        initial_delay = 300  # Wait 5 min before first poll
+        poll_interval = 60   # Then poll every 60s
         elapsed = 0
+        
+        # Initial wait - batch needs time to process
+        logging.info(f"Waiting {initial_delay}s before first poll...")
+        time.sleep(initial_delay)
+        elapsed = initial_delay
         
         while elapsed < max_wait_time:
             try:
@@ -344,9 +359,8 @@ def verb_audio_generation_batch_dag():
                 elif state == "JOB_STATE_EXPIRED":
                     raise AirflowFailException("Batch job expired")
                     
-                time.sleep(min(poll_interval, 60))
+                time.sleep(poll_interval)
                 elapsed += poll_interval
-                poll_interval = min(poll_interval * 2, 60)
                 
             except AirflowFailException:
                 raise
@@ -367,6 +381,10 @@ def verb_audio_generation_batch_dag():
         Downloads the output JSONL file from the File API.
         Returns: dict with results and metadata
         """
+        if not batch_info:
+            logging.info("No batch info provided. Skipping result fetching.")
+            return None
+            
         if not GEMINI_API_KEY:
             raise AirflowFailException("GEMINI_API_KEY not found")
 
@@ -426,6 +444,10 @@ def verb_audio_generation_batch_dag():
         Process audio results and upload to R2 in parallel.
         Returns: list of processed file info
         """
+        if not batch_results:
+            logging.info("No batch results provided. Skipping processing.")
+            return None
+            
         from botocore.config import Config
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import base64
@@ -600,6 +622,10 @@ def verb_audio_generation_batch_dag():
         Update database with audio file information.
         Includes rollback on failure.
         """
+        if not upload_results:
+            logging.info("No upload results provided. Skipping database update.")
+            return
+            
         from botocore.config import Config
         
         # S3 client for potential rollback
