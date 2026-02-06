@@ -3,3 +3,4 @@ boto3
 psycopg2-binary
 pydub==0.25.1
 google-genai
+tenacity>=8.0.0

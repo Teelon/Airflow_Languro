@@ -39,6 +39,26 @@ Context: This audio is for a conjugation app."""
     
     return "You are a professional voice talent. Pronounce the following sentence clearly."
 
+def get_language_code(language):
+    """Returns BCP-47 language code for Gemini TTS speechConfig."""
+    lang = language.lower()
+    
+    # Map language names to BCP-47 codes
+    language_codes = {
+        "french": "fr-FR",
+        "spanish": "es-ES",
+        "english": "en-US",
+        "german": "de-DE",
+        "italian": "it-IT",
+        "portuguese": "pt-BR",
+        "japanese": "ja-JP",
+        "korean": "ko-KR",
+        "chinese": "zh-CN",
+        "russian": "ru-RU",
+    }
+    
+    return language_codes.get(lang, "en-US")  # Default to English
+
 def derive_subject(pronoun_label, language):
     """Maps database pronoun labels to subjects based on language."""
     label = pronoun_label.lower()
@@ -182,3 +202,31 @@ def parse_audio_mime_type(mime_type: str) -> dict:
                 pass  # Keep default
 
     return {"bits_per_sample": bits_per_sample, "rate": rate}
+    
+def validate_audio_segment(audio) -> bool:
+    """
+    Validates an AudioSegment object.
+    
+    Args:
+        audio: pydub.AudioSegment object
+        
+    Returns:
+        True if valid, raises ValueError if invalid.
+    """
+    # Check duration (e.g., must be between 0.1s and 30s)
+    duration_sec = audio.duration_seconds
+    if duration_sec < 0.1:
+        raise ValueError(f"Audio too short: {duration_sec:.2f}s")
+    if duration_sec > 30:
+        raise ValueError(f"Audio too long: {duration_sec:.2f}s")
+        
+    # Check for silence (dBFS < -70 is effectively silent)
+    # Note: -inf dBFS is absolute silence
+    if audio.dBFS < -60 and audio.dBFS != float('-inf'): 
+         # Extremely quiet but not silent might be noise
+         pass 
+         
+    if audio.dBFS == float('-inf'):
+        raise ValueError("Audio is completely silent")
+        
+    return True
