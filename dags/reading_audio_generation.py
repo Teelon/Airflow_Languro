@@ -1,52 +1,89 @@
+
 import os
 import io
 import json
 import logging
-import time
-import wave
 import base64
+import re
 from datetime import datetime, timedelta
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.exceptions import AirflowFailException, AirflowSkipException
-from google import genai
-from google.genai import types
+from google.cloud import texttospeech
+
+# Try to import v1beta1 which supports enable_time_pointing
+TTS_BETA_AVAILABLE = False
+try:
+    from google.cloud import texttospeech_v1beta1 as tts
+    TTS_BETA_AVAILABLE = True
+    logging.info("Successfully imported texttospeech_v1beta1")
+except ImportError as e1:
+    logging.warning(f"Could not import texttospeech_v1beta1 from google.cloud: {e1}")
+    try:
+        import google.cloud.texttospeech_v1beta1 as tts
+        TTS_BETA_AVAILABLE = True
+        logging.info("Successfully imported google.cloud.texttospeech_v1beta1")
+    except ImportError as e2:
+        logging.warning(f"Could not import google.cloud.texttospeech_v1beta1: {e2}")
+        # Fallback to standard v1 (won't support timestamps)
+        tts = texttospeech
+        logging.warning("USING STANDARD texttospeech (v1) - timestamps will NOT work!")
+from google.oauth2 import service_account
 import boto3
 from pydub import AudioSegment
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
-# Import helpers (reusing existing helpers where applicable)
-try:
-    from dags.utils.verb_audio_helpers import (
-        get_language_code,
-        convert_to_wav,
-        validate_audio_segment
-    )
-except ImportError:
-    from utils.verb_audio_helpers import (
-        get_language_code,
-        convert_to_wav,
-        validate_audio_segment
-    )
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configuration
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "test-audio")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL_TTS_MODEL", "gemini-2.5-pro-preview-tts")
+
+# Voice Mapping Configuration
+# Can be overridden via Env Var: TTS_VOICE_MAPPING='{"en": "en-US-Neural2-F"}'
+DEFAULT_VOICE_MAPPING = {
+    "en": "en-US-Neural2-J",
+    "es": "es-US-Neural2-B",
+    "fr": "fr-FR-Neural2-B",
+    "de": "de-DE-Neural2-B",
+    "it": "it-IT-Neural2-C",
+    "pt": "pt-BR-Neural2-B",
+    "ru": "ru-RU-Wavenet-B", # Neural2 might not be available for all
+    "ja": "ja-JP-Neural2-B",
+    "ko": "ko-KR-Neural2-B",
+    "zh": "cmn-CN-Wavenet-B",
+}
+
+def get_voice_for_language(iso_code):
+    """
+    Get the configured voice for a language.
+    Falls back to environment variable mapping, then default mapping.
+    """
+    try:
+        env_mapping_str = os.environ.get("TTS_VOICE_MAPPING", "{}")
+        env_mapping = json.loads(env_mapping_str)
+    except json.JSONDecodeError:
+        logging.warning("Invalid JSON in TTS_VOICE_MAPPING env var, using defaults.")
+        env_mapping = {}
+
+    # Normalize iso_code (e.g. "en-US" -> "en")
+    lang_prefix = iso_code.lower().split("-")[0]
+    
+    # Priority: Env -> Default -> Fallback
+    voice = env_mapping.get(lang_prefix) or DEFAULT_VOICE_MAPPING.get(lang_prefix)
+    
+    if not voice:
+         # Fallback logic if language not explicitly mapped
+         # Try to reconstruct a reasonable default or fail safe
+         logging.warning(f"No voice mapping found for {iso_code}, defaulting to en-US-Neural2-J")
+         return "en-US-Neural2-J"
+         
+    return voice
+
 
 DB_CONN_ID = "languro_db"
-
-# Batch Config for Readings
-# Readings are longer (approx 150 words), so fewer items per batch to stay under token limits.
-# 150 words ~ 200 tokens. 
-# 25,000 tokens / 200 = ~125 readings.
-# Let's start with a small batch size of 10 for now.
-
-BATCH_SIZE = 10
-DAG_VERSION = "1.0.0"
+BATCH_SIZE = 10 # Process 10 readings at a time (Synchronous API calls)
+DAG_VERSION = "2.4.0-request-object-pattern" # Version tracking
 
 default_args = {
     "owner": "airflow",
@@ -60,13 +97,17 @@ default_args = {
     dag_id="reading_audio_generation_batch",
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
-    schedule="30 * * * *",  # Run at minute 30 (offset from verb DAG)
+    schedule="30 * * * *", 
     catchup=False,
     max_active_runs=1,
     max_active_tasks=1,
-    tags=["languro", "reading", "audio", "gemini", "batch"],
+    tags=["languro", "reading", "audio", "google-tts", "timestamps"],
 )
 def reading_audio_generation_batch_dag():
+    
+    # Log version at start of definition for visibility
+    logging.info(f"Loading reading_audio_generation DAG Version: {DAG_VERSION}")
+
 
     @task
     def fetch_pending_readings():
@@ -119,331 +160,176 @@ def reading_audio_generation_batch_dag():
         return readings
 
     @task
-    def build_batch_requests(readings: list):
+    def process_readings_with_google_tts(readings: list):
         """
-        Build Gemini API batch requests from reading data.
+        Process readings using Google Cloud TTS to get audio and timestamps.
+        Uploads to R2 and returns results for DB update.
         """
-        jsonl_lines = []
-        request_metadata = {}
-        
-        for idx, reading in enumerate(readings):
-            text_to_speak = reading['content']
-            
-            # Get language code (defaulting to en-US if missing, but should be there)
-            lang_code = get_language_code(reading['language_name'])
-            
-            # Using 'Journey' voice for readings as it might be more narrative-friendly
-            # or stick to 'Zephyr' for consistency. Let's start with Zephyr.
-            
-            jsonl_line = {
-                "key": str(idx),
-                "request": {
-                    "contents": [{"parts": [{"text": text_to_speak}]}],
-                    "generationConfig": {
-                        "responseModalities": ["AUDIO"],
-                        "speechConfig": {
-                            "languageCode": lang_code,
-                            "voiceConfig": {
-                                "prebuiltVoiceConfig": {
-                                    "voiceName": "Zephyr"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            jsonl_lines.append(jsonl_line)
-            request_metadata[str(idx)] = reading
-        
-        logging.info(f"Built {len(jsonl_lines)} batch requests for readings")
-        return {
-            'jsonl_lines': jsonl_lines,
-            'metadata': request_metadata
-        }
-
-    @task(
-        retries=3,
-        retry_delay=timedelta(minutes=1),
-        retry_exponential_backoff=True,
-    )
-    def submit_batch_job(batch_data: dict):
-        """
-        Submit batch job to Gemini API.
-        """
-        import tempfile
-        
-        if not GEMINI_API_KEY:
-            raise AirflowFailException("GEMINI_API_KEY not found")
-
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        jsonl_lines = batch_data['jsonl_lines']
-        
-        if not jsonl_lines:
-            logging.info("No requests to submit")
+        if not readings:
             return None
-            
-        logging.info(f"Submitting batch job with {len(jsonl_lines)} reading requests")
-        
-        # Retry logic for 429s (same as verb dag)
-        MAX_RETRIES = 5
-        BASE_DELAY = 60
-        
-        jsonl_path = None
-        
+
+        # Initialize Google Cloud TTS Client
         try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False, encoding='utf-8') as f:
-                for line in jsonl_lines:
-                    f.write(json.dumps(line, ensure_ascii=False) + '\n')
-                jsonl_path = f.name
-            
-            uploaded_file = client.files.upload(
-                file=jsonl_path,
-                config=types.UploadFileConfig(
-                    display_name=f'reading_audio_batch_{int(time.time())}',
-                    mime_type='jsonl'
-                )
-            )
-            
-            last_error = None
-            for attempt in range(MAX_RETRIES):
-                try:
-                    batch_job = client.batches.create(
-                        model=GEMINI_MODEL,
-                        src=uploaded_file.name,
-                        config={'display_name': f'reading_audio_{int(time.time())}'}
-                    )
-                    
-                    job_name = batch_job.name
-                    logging.info(f"Batch job submitted: {job_name}")
-                    
-                    return {
-                        'job_name': job_name,
-                        'metadata': batch_data['metadata']
-                    }
-                except Exception as e:
-                    error_str = str(e)
-                    if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
-                        wait_time = BASE_DELAY * (2 ** attempt)
-                        logging.warning(f"Rate limited, waiting {wait_time}s...")
-                        time.sleep(wait_time)
-                        last_error = e
-                    else:
-                        raise
+             creds = None
+             # Check for JSON content in env var first (avoids file mounting issues)
+             creds_json = os.environ.get("GOOGLE_APP_CREDS_JSON")
+             if creds_json:
+                 try:
+                     creds_info = json.loads(creds_json)
+                     creds = service_account.Credentials.from_service_account_info(creds_info)
+                     logging.info("Loaded Google Credentials from GOOGLE_APP_CREDS_JSON")
+                 except json.JSONDecodeError:
+                     logging.warning("GOOGLE_APP_CREDS_JSON contains invalid JSON")
 
-            raise AirflowFailException(f"Batch submission failed after retries: {last_error}")
-
+             if creds:
+                 client = tts.TextToSpeechClient(credentials=creds)
+             else:
+                 # Fallback to ADC
+                 logging.info("Attempting to load Google Credentials from ADC (Beta Client)...")
+                 client = tts.TextToSpeechClient()
         except Exception as e:
-            raise AirflowFailException(f"Batch submission failed: {e}")
-        finally:
-            if jsonl_path and os.path.exists(jsonl_path):
-                os.remove(jsonl_path)
+             raise AirflowFailException(f"Failed to initialize Google TTS Client: {e}")
 
-    @task(
-        retries=5,
-        retry_delay=timedelta(seconds=30),
-        retry_exponential_backoff=True,
-        max_retry_delay=timedelta(minutes=5),
-        execution_timeout=timedelta(minutes=20), # Readings might take longer
-    )
-    def poll_batch_completion(batch_info: dict):
-        """
-        Poll batch job until completion.
-        """
-        if not batch_info:
-            return None
-            
-        if not GEMINI_API_KEY:
-            raise AirflowFailException("GEMINI_API_KEY not found")
-
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        job_name = batch_info['job_name']
-        
-        @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=30))
-        def get_status():
-            return client.batches.get(name=job_name)
-
-        max_wait_time = 1200 # 20 mins
-        initial_delay = 120  # Readings might be faster to queue but processing takes time
-        poll_interval = 30
-        elapsed = 0
-        
-        logging.info(f"Waiting {initial_delay}s before first poll...")
-        time.sleep(initial_delay)
-        elapsed = initial_delay
-        
-        while elapsed < max_wait_time:
-            job_status = get_status()
-            state = job_status.state
-            logging.info(f"Batch state: {state} ({elapsed}s)")
-            
-            if state == "JOB_STATE_SUCCEEDED":
-                return batch_info
-            elif state in ["JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"]:
-                raise AirflowFailException(f"Batch job failed: {state}")
-                
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-            
-        raise AirflowFailException("Batch job timeout")
-
-    @task(retries=2)
-    def fetch_batch_results(batch_info: dict):
-        if not batch_info: return None
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        job_name = batch_info['job_name']
-        
-        batch_job = client.batches.get(name=job_name)
-        if not batch_job.dest or not batch_job.dest.file_name:
-            logging.warning("No output file found")
-            return {'results': [], 'metadata': batch_info['metadata']}
-            
-        content = client.files.download(file=batch_job.dest.file_name).decode('utf-8')
-        results = []
-        for line in content.splitlines():
-            if line.strip():
-                try:
-                    results.append(json.loads(line))
-                except:
-                    pass
-        return {'results': results, 'metadata': batch_info['metadata']}
-
-    @task(retries=2)
-    def process_and_upload_results(batch_results: dict):
-        """
-        Process audio results and upload to R2.
-        """
-        if not batch_results: return None
-        
-        from botocore.config import Config
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
         s3_client = boto3.client(
             service_name="s3",
             endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
             aws_access_key_id=R2_ACCESS_KEY_ID,
             aws_secret_access_key=R2_SECRET_ACCESS_KEY,
             region_name="auto",
-            config=Config(signature_version='s3v4')
         )
-        
-        results = batch_results['results']
-        metadata = batch_results['metadata']
-        
-        files_to_upload = []
-        failed_items = []
-        
-        for result in results:
-            key = result.get('key')
-            if not key or key not in metadata: continue
-            
-            meta = metadata[key]
-            r_id = meta['reading_id']
-            
-            if result.get('error'):
-                failed_items.append({'reading_id': r_id, 'error': result.get('error')})
-                continue
-                
-            try:
-                # Extract Audio (Same logic as verb DAG)
-                response = result.get('response')
-                audio_chunks = []
-                if response and response.get('candidates'):
-                    if response['candidates'][0].get('content', {}).get('parts'):
-                        for part in response['candidates'][0]['content']['parts']:
-                            if part.get('inlineData'):
-                                audio_chunks.append({
-                                    'data': base64.b64decode(part['inlineData']['data']),
-                                    'mime_type': part['inlineData']['mimeType']
-                                })
-                
-                if not audio_chunks:
-                    failed_items.append({'reading_id': r_id, 'error': 'No audio data'})
-                    continue
-                    
-                raw_audio = b''.join([chunk['data'] for chunk in audio_chunks])
-                mime_type = audio_chunks[0].get('mime_type') or "audio/L16;rate=24000"
-                
-                # Convert to WAV container if raw PCM
-                is_riff = raw_audio.startswith(b'RIFF')
-                if (("pcm" in mime_type.lower() or "l16" in mime_type.lower()) and not is_riff):
-                    wav_buffer = io.BytesIO()
-                    with wave.open(wav_buffer, 'wb') as wav_file:
-                        wav_file.setnchannels(1)
-                        wav_file.setsampwidth(2)
-                        wav_file.setframerate(24000)
-                        wav_file.writeframes(raw_audio)
-                    wav_buffer.seek(0)
-                    audio = AudioSegment.from_file(wav_buffer, format="wav")
-                else:
-                    audio = AudioSegment.from_file(io.BytesIO(raw_audio))
-                
-                # Validate Audio
-                validate_audio_segment(audio, max_duration=300)
 
-                # Convert to Opus
-                opus_buffer = io.BytesIO()
-                audio.export(opus_buffer, format="opus", codec="libopus", bitrate="64k")
-                audio_data = opus_buffer.getvalue()
+        processed_results = []
+        failed_items = []
+
+        for reading in readings:
+            r_id = reading['reading_id']
+            iso_code = reading['iso_code']
+            content = reading['content']
+
+            try:
+                # 1. Prepare SSML with Marks
+                # Split by spaces to approximate words, but keep full punctuation for the "word" mapping if possible
+                # A robust way is to find word boundaries. For simplicity, we'll split by spaces and wrap.
                 
-                # Generate File Key
-                # readings/{iso_code}/{reading_id}.opus
-                safe_lang = meta['iso_code'].lower()
+                # Cleaning extra whitespace
+                text_clean = re.sub(r'\s+', ' ', content).strip()
+                words = text_clean.split(' ')
+                
+                ssml_parts = []
+                word_map = {} # Map index to word text for alignment JSON
+                
+                for i, word in enumerate(words):
+                    # We wrap every "token" (word + potential punctuation attached)
+                    # Use a safe mark name. "w{i}"
+                    mark_name = f"w{i}"
+                    ssml_parts.append(f'<mark name="{mark_name}"/>{word}')
+                    word_map[mark_name] = word
+                
+                ssml_input = f"<speak>{' '.join(ssml_parts)}</speak>"
+                
+                # 2. Configure STS Request
+                input_text = tts.SynthesisInput(ssml=ssml_input)
+                
+                voice_name = get_voice_for_language(iso_code)
+                voice_lang_code = "-".join(voice_name.split("-")[:2]) # e.g. en-US-Neural2-J -> en-US
+                
+                voice_params = tts.VoiceSelectionParams(
+                    language_code=voice_lang_code,
+                    name=voice_name
+                )
+                
+                audio_config = tts.AudioConfig(
+                    audio_encoding=tts.AudioEncoding.MP3, # Get MP3 directly
+                    speaking_rate=1.0
+                )
+                
+                # 3. Call API using SynthesizeSpeechRequest object (required for enable_time_pointing)
+                logging.info(f"Generating audio for reading {r_id} ({iso_code}) using {voice_name}")
+                
+                request = tts.SynthesizeSpeechRequest(
+                    input=input_text,
+                    voice=voice_params,
+                    audio_config=audio_config,
+                    enable_time_pointing=[tts.SynthesizeSpeechRequest.TimepointType.SSML_MARK],
+                )
+                
+                response = client.synthesize_speech(request=request)
+                
+                # 4. Process Timestamps
+                alignment = []
+                for point in response.timepoints:
+                    mark_name = point.mark_name
+                    if mark_name in word_map:
+                        alignment.append({
+                            "word": word_map[mark_name],
+                            "start": point.time_seconds
+                        })
+                
+                # 5. Process Audio (MP3 -> Opus for standardization/size if desired, but User pattern asked for Opus)
+                # Google returns MP3. We can store MP3 or convert to OPUS. 
+                # Existing pattern uses Opus. Let's convert to Opus.
+                
+                audio_content = response.audio_content
+                
+                # Use pydub to convert MP3 bytes to Opus
+                audio_segment = AudioSegment.from_file(io.BytesIO(audio_content), format="mp3")
+                
+                opus_buffer = io.BytesIO()
+                audio_segment.export(opus_buffer, format="opus", codec="libopus", bitrate="64k")
+                opus_data = opus_buffer.getvalue()
+                
+                # 6. Upload to R2
+                safe_lang = iso_code.lower()
                 file_key = f"readings/{safe_lang}/{r_id}.opus"
                 
-                files_to_upload.append((r_id, file_key, audio_data))
-                
-            except Exception as e:
-                failed_items.append({'reading_id': r_id, 'error': str(e)})
-                
-        # Upload
-        processed_files = []
-        if files_to_upload:
-            def upload(info):
-                r_id, f_key, data = info
                 s3_client.put_object(
                     Bucket=R2_BUCKET_NAME,
-                    Key=f_key,
-                    Body=data,
+                    Key=file_key,
+                    Body=opus_data,
                     ContentType="audio/opus"
                 )
-                return {'reading_id': r_id, 'file_key': f_key}
                 
-            with ThreadPoolExecutor(max_workers=10) as ex:
-                futures = {ex.submit(upload, f): f for f in files_to_upload}
-                for fut in as_completed(futures):
-                    try:
-                        processed_files.append(fut.result())
-                    except Exception as e:
-                        # Log error but don't stop everything
-                        logging.error(f"Upload error: {e}")
-                        
-        return {
-            'processed_files': processed_files,
-            'failed_items': failed_items
-        }
+                processed_results.append({
+                    "reading_id": r_id,
+                    "file_key": file_key,
+                    "alignment": json.dumps(alignment)
+                })
+                
+            except Exception as e:
+                logging.error(f"Failed to process reading {r_id}: {e}")
+                failed_items.append({"reading_id": r_id, "error": str(e)})
 
-    @task(retries=3)
-    def update_database(upload_results: dict):
-        if not upload_results: return
-        
+        if failed_items:
+            logging.warning(f"Failed items: {failed_items}")
+
+        if not processed_results and failed_items:
+             raise AirflowFailException("All items failed to process.")
+
+        return processed_results
+
+    @task
+    def update_database(processed_results: list):
+        """
+        Update ReadingLesson table with audioKey and alignment.
+        """
+        if not processed_results:
+            return
+
         pg_hook = PostgresHook(postgres_conn_id=DB_CONN_ID)
         conn = pg_hook.get_conn()
         cursor = conn.cursor()
         
         try:
-            for item in upload_results['processed_files']:
-                # Update reading_lessons table
-                # We do NOT set alignment here yet as we don't have it.
+            for item in processed_results:
                 sql = """
                     UPDATE reading_lessons
-                    SET "audioKey" = %s
+                    SET "audioKey" = %s, alignment = %s::json
                     WHERE id = %s
                 """
-                cursor.execute(sql, (item['file_key'], item['reading_id']))
+                cursor.execute(sql, (item['file_key'], item['alignment'], item['reading_id']))
                 
             conn.commit()
-            logging.info(f"Updated {len(upload_results['processed_files'])} reading lessons")
+            logging.info(f"Updated {len(processed_results)} reading lessons with audio and alignment.")
             
         except Exception as e:
             conn.rollback()
@@ -454,11 +340,7 @@ def reading_audio_generation_batch_dag():
 
     # Flow
     readings = fetch_pending_readings()
-    batch_data = build_batch_requests(readings)
-    batch_info = submit_batch_job(batch_data)
-    completed = poll_batch_completion(batch_info)
-    results = fetch_batch_results(completed)
-    uploaded = process_and_upload_results(results)
-    update_database(uploaded)
+    results = process_readings_with_google_tts(readings)
+    update_database(results)
 
 reading_audio_generation_batch_dag()
