@@ -203,22 +203,23 @@ def parse_audio_mime_type(mime_type: str) -> dict:
 
     return {"bits_per_sample": bits_per_sample, "rate": rate}
     
-def validate_audio_segment(audio) -> bool:
+def validate_audio_segment(audio, max_duration=30) -> bool:
     """
     Validates an AudioSegment object.
     
     Args:
         audio: pydub.AudioSegment object
+        max_duration: Maximum allowed duration in seconds (default 30s)
         
     Returns:
         True if valid, raises ValueError if invalid.
     """
-    # Check duration (e.g., must be between 0.1s and 30s)
+    # Check duration
     duration_sec = audio.duration_seconds
     if duration_sec < 0.1:
         raise ValueError(f"Audio too short: {duration_sec:.2f}s")
-    if duration_sec > 30:
-        raise ValueError(f"Audio too long: {duration_sec:.2f}s")
+    if duration_sec > max_duration:
+        raise ValueError(f"Audio too long: {duration_sec:.2f}s (max {max_duration}s)")
         
     # Check for silence (dBFS < -70 is effectively silent)
     # Note: -inf dBFS is absolute silence
