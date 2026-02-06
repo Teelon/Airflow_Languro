@@ -49,9 +49,12 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL_TTS_MODEL", "gemini-2.5-pro-preview-
 DB_CONN_ID = "languro_db"
 
 # Tier 1 Batch Config
-BATCH_SIZE = 10
-MAX_BATCH_TOKENS = 20000
-DAG_VERSION = "1.6.0-jsonl-upload"
+# Gemini 2.5 TTS Tier 1: 25,000 batch enqueued tokens
+# MINIMAL TEXT MODE: ~30 tokens per request (quality confirmed!)
+# 300 requests × 30 tokens = ~9k tokens (safe margin under 25k)
+BATCH_SIZE = 300
+MAX_BATCH_TOKENS = 25000
+DAG_VERSION = "2.0.1-minimal-text-production"
 
 default_args = {
     "owner": "airflow",
@@ -65,7 +68,7 @@ default_args = {
     dag_id="verb_audio_generation_batch",
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
-    schedule="*/15 * * * *",
+    schedule="*/40 * * * *",
     catchup=False,
     max_active_runs=1,
     max_active_tasks=1,
@@ -140,6 +143,11 @@ def verb_audio_generation_batch_dag():
         Build Gemini API batch requests from conjugation data.
         Uses the JSONL file format like the working tts.py example.
         Each line: {"key": "...", "request": {...}}
+        
+        MINIMAL TEXT APPROACH: Only sends the text to speak.
+        The languageCode in speechConfig handles pronunciation.
+        This reduces tokens from ~200 to ~30 per request.
+        
         Returns: dict with 'jsonl_lines' (list of dicts) and 'metadata' dict keyed by index
         """
         jsonl_lines = []
@@ -147,25 +155,19 @@ def verb_audio_generation_batch_dag():
         
         for idx, conj in enumerate(conjugations):
             subject = derive_subject(conj['pronoun'], conj['language_name'])
-            prompt_text = f"{subject} {conj['form']}."
-            pronounciation_note = get_pronunciation_note(
-                conj['pronoun'], 
-                conj['tense'], 
-                conj['form'], 
-                conj['language_name']
-            )
-            sys_instruction = get_system_prompt(conj['language_name'])
-            user_content = f"{prompt_text} {pronounciation_note}"
             
-            # Get language code for Speech Config
+            # MINIMAL TEXT: Just the conjugation to speak
+            # e.g., "yo como" instead of full instruction
+            text_to_speak = f"{subject} {conj['form']}"
+            
+            # Get language code for Speech Config (this handles pronunciation)
             lang_code = get_language_code(conj['language_name'])
             
-            # Build JSONL line using the EXACT format from working tts.py example:
-            # {"key": "<index>", "request": {...}}
+            # Build JSONL line - minimal text, rely on languageCode for pronunciation
             jsonl_line = {
                 "key": str(idx),
                 "request": {
-                    "contents": [{"parts": [{"text": f"{sys_instruction}\n\n{user_content}"}]}],
+                    "contents": [{"parts": [{"text": text_to_speak}]}],
                     "generationConfig": {
                         "responseModalities": ["AUDIO"],
                         "speechConfig": {
@@ -184,10 +186,10 @@ def verb_audio_generation_batch_dag():
             request_metadata[str(idx)] = {
                 **conj,  # Include all conjugation data
                 'subject': subject,
-                'user_content': user_content
+                'text_to_speak': text_to_speak
             }
         
-        logging.info(f"Built {len(jsonl_lines)} batch requests in JSONL format")
+        logging.info(f"Built {len(jsonl_lines)} batch requests (minimal text mode)")
         return {
             'jsonl_lines': jsonl_lines,
             'metadata': request_metadata
@@ -202,6 +204,7 @@ def verb_audio_generation_batch_dag():
         """
         Submit batch job to Gemini API using JSONL file upload.
         This matches the working tts.py example approach.
+        Includes retry logic for 429 rate limit errors.
         Returns: batch job name and metadata
         """
         import tempfile
@@ -213,6 +216,13 @@ def verb_audio_generation_batch_dag():
         jsonl_lines = batch_data['jsonl_lines']
         
         logging.info(f"Submitting batch job with {len(jsonl_lines)} requests via JSONL file")
+        
+        # Retry settings for 429 errors
+        MAX_RETRIES = 5
+        BASE_DELAY = 60  # Start with 1 minute wait
+        
+        jsonl_path = None
+        uploaded_file = None
         
         try:
             # 1. Create a temporary JSONL file
@@ -233,30 +243,52 @@ def verb_audio_generation_batch_dag():
             )
             logging.info(f"Uploaded file: {uploaded_file.name}")
             
-            # 3. Create batch job using the uploaded file as source
-            batch_job = client.batches.create(
-                model=GEMINI_MODEL,
-                src=uploaded_file.name,
-                config={'display_name': f'verb_audio_{int(time.time())}'}
-            )
+            # 3. Create batch job with retry for 429 errors
+            last_error = None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    batch_job = client.batches.create(
+                        model=GEMINI_MODEL,
+                        src=uploaded_file.name,
+                        config={'display_name': f'verb_audio_{int(time.time())}'}
+                    )
+                    
+                    job_name = batch_job.name
+                    logging.info(f"Batch job submitted: {job_name}")
+                    
+                    return {
+                        'job_name': job_name,
+                        'metadata': batch_data['metadata']
+                    }
+                    
+                except Exception as e:
+                    error_str = str(e)
+                    if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+                        wait_time = BASE_DELAY * (2 ** attempt)  # Exponential backoff
+                        logging.warning(
+                            f"Rate limited (429), attempt {attempt + 1}/{MAX_RETRIES}. "
+                            f"Waiting {wait_time}s before retry..."
+                        )
+                        last_error = e
+                        time.sleep(wait_time)
+                    else:
+                        raise  # Re-raise non-429 errors immediately
             
-            job_name = batch_job.name
-            logging.info(f"Batch job submitted: {job_name}")
+            # All retries exhausted
+            raise AirflowFailException(f"Batch submission failed after {MAX_RETRIES} retries: {last_error}")
             
-            # Clean up temp file
-            try:
-                os.remove(jsonl_path)
-            except:
-                pass
-            
-            return {
-                'job_name': job_name,
-                'metadata': batch_data['metadata']
-            }
-            
+        except AirflowFailException:
+            raise
         except Exception as e:
             logging.error(f"Failed to submit batch job: {e}")
             raise AirflowFailException(f"Batch submission failed: {e}")
+        finally:
+            # Clean up temp file
+            if jsonl_path:
+                try:
+                    os.remove(jsonl_path)
+                except:
+                    pass
 
     @task(
         retries=5,
@@ -391,12 +423,15 @@ def verb_audio_generation_batch_dag():
     )
     def process_and_upload_results(batch_results: dict):
         """
-        Process audio results and upload to R2.
+        Process audio results and upload to R2 in parallel.
         Returns: list of processed file info
         """
         from botocore.config import Config
-        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         import base64
+
+        # Number of concurrent uploads (adjust based on performance)
+        MAX_UPLOAD_WORKERS = 20
 
         s3_client = boto3.client(
             service_name="s3",
@@ -408,19 +443,21 @@ def verb_audio_generation_batch_dag():
         )
 
         results = batch_results['results']
-        metadata = batch_results['metadata']  # Now a dict keyed by string index
+        metadata = batch_results['metadata']  # Dict keyed by string index
         
-        processed_files = []
+        # Stage 1: Process all audio files first (CPU-bound)
+        files_to_upload = []  # List of (c_id, file_key, audio_data)
         failed_items = []
         
+        logging.info(f"Processing {len(results)} audio results...")
+        
         for result in results:
-            # Extract the key from the JSONL result (matches tts.py pattern)
+            # Extract the key from the JSONL result
             key = result.get('key')
             if key is None:
-                logging.warning(f"Result missing 'key' field, skipping: {result}")
+                logging.warning(f"Result missing 'key' field, skipping")
                 continue
             
-            # Look up metadata using the key
             meta = metadata.get(str(key))
             if not meta:
                 logging.warning(f"No metadata found for key {key}, skipping")
@@ -436,26 +473,21 @@ def verb_audio_generation_batch_dag():
             
             try:
                 # Extract audio chunks from the response
-                # JSONL format: {"key": "...", "response": {"candidates": [...]}}
                 response = result.get('response')
                 audio_chunks = []
                 
-                # Navigate dict structure: response -> candidates -> content -> parts -> inlineData
                 if response and response.get('candidates'):
                     candidates = response['candidates']
                     if candidates and candidates[0].get('content'):
                          content = candidates[0]['content']
                          if content.get('parts'):
                              for part in content['parts']:
-                                 inline_data = part.get('inlineData')  # camelCase in JSONL
+                                 inline_data = part.get('inlineData')
                                  if inline_data and inline_data.get('data'):
-                                     # Decode base64 data
-                                     data_encoded = inline_data['data']
-                                     data_bytes = base64.b64decode(data_encoded)
-                                     
+                                     data_bytes = base64.b64decode(inline_data['data'])
                                      audio_chunks.append({
                                          'data': data_bytes,
-                                         'mime_type': inline_data.get('mimeType')  # camelCase
+                                         'mime_type': inline_data.get('mimeType')
                                      })
                 
                 if not audio_chunks:
@@ -463,88 +495,88 @@ def verb_audio_generation_batch_dag():
                     failed_items.append({'conjugation_id': c_id, 'error': 'No audio data'})
                     continue
                 
-                # Convert to Opus
+                # Combine audio chunks
                 raw_audio = b''.join([chunk['data'] for chunk in audio_chunks])
+                mime_type = audio_chunks[0].get('mime_type') or "audio/L16;rate=24000"
                 
-                # Detect mime type from chunks
-                mime_type = audio_chunks[0].get('mime_type')
-                
-                # Gemini TTS 2.5 Batch models return raw 16-bit PCM at 24kHz by default
-                # and often don't return a specific mime type in the inline data.
-                # If explicit mime type is missing or generic, enforce the known PCM format.
-                if not mime_type or mime_type.lower() == "application/octet-stream":
-                    mime_type = "audio/L16;rate=24000"
-                    
-                logging.info(f"Processing audio for conjugation {c_id} using mime_type: {mime_type}")
-                
-                # Debug: Log the first 64 bytes to diagnose format (Endianness, Header, etc.)
-                if raw_audio:
-                    header_hex = binascii.hexlify(raw_audio[:64]).decode('utf-8')
-                    logging.info(f"Raw Audio Header (64 bytes): {header_hex}")
-
                 # Check for RIFF header (WAV)
                 is_riff = raw_audio.startswith(b'RIFF')
 
                 if (("pcm" in mime_type.lower() or "l16" in mime_type.lower()) and not is_riff):
-                    # Wrap raw PCM into WAV container using wave module
-                    # Settings: 1 channel, 16-bit (2 bytes), 24kHz
-                    # This is the same approach used in the working example script.
-                    logging.info(f"Wrapping raw PCM into WAV container (1ch, 16-bit, 24kHz)")
-                    
+                    # Wrap raw PCM into WAV container
                     wav_buffer = io.BytesIO()
                     with wave.open(wav_buffer, 'wb') as wav_file:
-                        wav_file.setnchannels(1)        # Mono
-                        wav_file.setsampwidth(2)        # 16-bit (2 bytes per sample)
-                        wav_file.setframerate(24000)    # 24kHz
+                        wav_file.setnchannels(1)
+                        wav_file.setsampwidth(2)
+                        wav_file.setframerate(24000)
                         wav_file.writeframes(raw_audio)
-                    
                     wav_buffer.seek(0)
-                    audio_data = wav_buffer.getvalue()
-                    
-                    # Load for validation only
-                    audio = AudioSegment.from_file(io.BytesIO(audio_data), format="wav")
-
+                    audio = AudioSegment.from_file(wav_buffer, format="wav")
                 else:
-                    # Container format (MP3, WAV, OGG, etc.) OR Unexpected RIFF in PCM mime type
-                    logging.info(f"Treating audio as container format (Is RIFF: {is_riff}, Mime: {mime_type})")
                     audio = AudioSegment.from_file(io.BytesIO(raw_audio))
-                    
-                    # Export to WAV for testing
-                    wav_buffer = io.BytesIO()
-                    audio.export(wav_buffer, format="wav")
-                    audio_data = wav_buffer.getvalue()
 
-                # Validate Audio (Shared)
+                # Validate Audio
                 validate_audio_segment(audio)
 
-                # Generate key based on metadata (using .wav for testing)
+                # Convert to Opus
+                opus_buffer = io.BytesIO()
+                audio.export(opus_buffer, format="opus", codec="libopus", bitrate="64k")
+                audio_data = opus_buffer.getvalue()
+
+                # Generate file key
                 safe_lang = meta['iso_code'].lower() if meta.get('iso_code') else meta.get('language_name', 'unknown').lower()
                 safe_verb = meta['verb'].replace(" ", "_").lower()
                 safe_tense = meta['tense'].replace(" ", "_").lower()
                 safe_subject = meta['subject'].replace(" ", "_").lower()
                 safe_form = meta['form'].replace(" ", "_").lower()
                 
-                file_key = f"conjugation/{safe_lang}/{safe_verb}/{safe_tense}/{safe_subject}_{safe_form}.wav"
-
-                # Upload to R2 (WAV for testing)
-                s3_client.put_object(
-                    Bucket=R2_BUCKET_NAME,
-                    Key=file_key,
-                    Body=audio_data,
-                    ContentType="audio/wav"
-                )
+                file_key = f"conjugation/{safe_lang}/{safe_verb}/{safe_tense}/{safe_subject}_{safe_form}.opus"
                 
-                processed_files.append({
-                    'conjugation_id': c_id,
-                    'file_key': file_key,
-                    'size_bytes': len(audio_data)
-                })
-                
-                logging.info(f"Uploaded {file_key} ({len(audio_data)} bytes)")
+                files_to_upload.append((c_id, file_key, audio_data))
 
             except Exception as e:
                 logging.error(f"Failed to process conjugation {c_id}: {e}")
                 failed_items.append({'conjugation_id': c_id, 'error': str(e)})
+
+        logging.info(f"Processed {len(files_to_upload)} audio files, {len(failed_items)} failed")
+        
+        # Stage 2: Upload in parallel (I/O-bound)
+        processed_files = []
+        
+        def upload_file(file_info):
+            """Upload a single file to R2."""
+            c_id, file_key, audio_data = file_info
+            s3_client.put_object(
+                Bucket=R2_BUCKET_NAME,
+                Key=file_key,
+                Body=audio_data,
+                ContentType="audio/opus"
+            )
+            return {
+                'conjugation_id': c_id,
+                'file_key': file_key,
+                'size_bytes': len(audio_data)
+            }
+        
+        if files_to_upload:
+            logging.info(f"Uploading {len(files_to_upload)} files to R2 with {MAX_UPLOAD_WORKERS} workers...")
+            
+            with ThreadPoolExecutor(max_workers=MAX_UPLOAD_WORKERS) as executor:
+                future_to_file = {
+                    executor.submit(upload_file, f): f for f in files_to_upload
+                }
+                
+                for future in as_completed(future_to_file):
+                    file_info = future_to_file[future]
+                    c_id = file_info[0]
+                    try:
+                        result = future.result()
+                        processed_files.append(result)
+                    except Exception as e:
+                        logging.error(f"Upload failed for conjugation {c_id}: {e}")
+                        failed_items.append({'conjugation_id': c_id, 'error': str(e)})
+            
+            logging.info(f"Upload complete: {len(processed_files)} successful")
 
         logging.info(
             f"Processing complete: {len(processed_files)} successful, "
