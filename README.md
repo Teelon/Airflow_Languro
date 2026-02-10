@@ -1,6 +1,6 @@
-# Languro Airflow Pipelines
+# Languro Airflow & Data Pipelines
 
-This project manages the data orchestration for Languro, specifically the generation of high-quality verb conjugation audio using Gemini 2.5 TTS and storage in Cloudflare R2.
+This project manages the data orchestration for Languro, handling high-volume audio generation and processing using Airflow.
 
 ## 🚀 Quick Start
 
@@ -13,10 +13,18 @@ Copy the example environment file and fill in your credentials:
 ```powershell
 cp .env.example .env
 ```
-Open `.env` and provide:
-- **R2 Credentials**: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ACCOUNT_ID`, and `R2_BUCKET_NAME`.
+
+Open `.env` and configure the following:
+
+#### Storage & Database
+- **R2 Credentials**: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`.
 - **Database**: `AIRFLOW_CONN_LANGURO_DB` (Postgres URL for the main Languro app).
-- **Gemini SPI**: `GEMINI_API_KEY`.
+
+#### AI Services
+- **Gemini API**: `GEMINI_API_KEY` (for Verb Audio generation).
+- **Gemini Model**: `GEMINI_MODEL_TTS_MODEL` (defaults to `gemini-2.5-pro-preview-tts`).
+- **Google Cloud TTS**: `GOOGLE_APP_CREDS_JSON`.
+  > **⚠️ IMPORTANT**: This variable must contain the **minified** JSON content of your Google Cloud Service Account key. Do not use newlines.
 
 ### 3. Build and Run
 Start the Airflow environment:
@@ -24,12 +32,11 @@ Start the Airflow environment:
 astro dev start
 ```
 This will:
-1. Build a custom Docker image with all dependencies (`google-genai`, `boto3`, etc.).
+1. Build a custom Docker image with dependencies (`google-genai`, `boto3`, `google-cloud-texttospeech`, etc.).
 2. Initialize a local Postgres metadata database.
 3. Start the Webserver, Scheduler, and Triggerer.
 
 ### 4. Access the UI
-Once the command completes, go to:
 - **URL**: [http://localhost:8080](http://localhost:8080)
 - **Login**: `admin` / `admin`
 
@@ -37,17 +44,30 @@ Once the command completes, go to:
 
 ## 🏗️ Pipelines (DAGs)
 
-### `verb_audio_generation`
-This is the core pipeline for Languro's content:
-1. **Fetch**: Queries the Languro database for conjugations missing audio.
-2. **Generate**: Calls Gemini 2.5 (`gemini-2.5-pro-preview-tts`) with language-specific pronunciation rules.
-3. **Format**: Generates high-efficiency `.opus` audio files.
-4. **Store**: Uploads files to R2 using the convention: `conjugation/{iso_code}/{verb}/{tense}/{pronoun}_{form}.opus`.
-5. **Update**: Writes the R2 key back to the database and marks `has_audio = true`.
+### 1. `verb_audio_generation_batch`
+Generates audio for verb conjugations using the **Gemini Batch API** for high throughput and lower cost.
+- **Source**: Queries `conjugations` table for items where `has_audio = false`.
+- **Generation**: Uses `gemini-2.5-pro-preview-tts` with a minimal text prompt to reduce token usage.
+- **Output**: Generates `.opus` files (64k bitrate).
+- **Storage**: Uploads to R2 at `conjugation/{iso_code}/{verb}/{tense}/{pronoun}_{form}.opus`.
+- **Schedule**: Hourly at minute 0 (`0 * * * *`).
+
+### 2. `reading_audio_generation_batch`
+Generates audio and word-level timestamps for reading lessons using **Google Cloud TTS**.
+- **Source**: Queries `reading_lessons` table for items where `audioKey` is NULL.
+- **Generation**: Uses Google Cloud TTS `v1beta1` to request SSML marks for word-level timestamps.
+- **Output**: Generates `.opus` files.
+- **Storage**: Uploads to R2 at `readings/{iso_code}/{reading_id}.opus`.
+- **Metadata**: Updates the database with the R2 file key and the timestamp alignment JSON.
+- **Schedule**: Hourly at minute 30 (`30 * * * *`).
 
 ## 🛠️ Maintenance
 
-**Adding new dependencies**: Add them to `requirements.txt` and run `astro dev restart`.
+**Adding new dependencies**: 
+Add them to `requirements.txt` and restart:
+```powershell
+astro dev restart
+```
 
 **Stop the environment**:
 ```powershell
@@ -60,10 +80,11 @@ astro dev logs
 ```
 
 **Clear DAG run history**:
-To delete all run history for a specific DAG (useful for starting fresh):
+To delete all run history for a specific DAG (useful for testing from scratch):
 ```powershell
 astro dev bash
 # Inside the container:
-airflow dags delete verb_audio_generation --yes
+airflow dags delete verb_audio_generation_batch --yes
+airflow dags delete reading_audio_generation_batch --yes
 exit
 ```
